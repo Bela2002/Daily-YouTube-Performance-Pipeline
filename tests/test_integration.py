@@ -201,20 +201,30 @@ def verify(now, deep=True, overrides=()):
     return {c.name: c for c in checks}, client
 
 
-def test_verify_all_good(conn):
+TEST_READER = "looker_reader_test"
+
+
+def test_verify_all_good(conn, monkeypatch):
+    # Roles are shared by every database on the server, so never touch the real looker_reader.
+    monkeypatch.setattr(db, "READER_ROLE", TEST_READER)
     run(DAY1)
-    db.create_reader(conn, "a-strong-test-password")
-    checks, client = verify(DAY1)
-    fails = [f"{c.name}: {c.detail}" for c in checks.values() if c.status == FAIL]
-    assert fails == []
-    assert checks["API key works"].status == PASS
-    assert checks["Alpha News LK"].status == PASS          # completeness cross-check
-    assert checks["read-only dashboard user"].status == PASS
-    assert checks["API key not stored in database"].status == PASS
-    assert checks["matches YouTube right now"].status == PASS
-    assert client.quota_units_used >= 200                   # 2 channels x search (100 units)
-    with psycopg.connect(DB_URL, autocommit=True) as c:
-        c.execute("DROP OWNED BY looker_reader; DROP ROLE looker_reader")
+    db.create_reader(conn, "a-strong-test-password", role=TEST_READER)
+    try:
+        checks, client = verify(DAY1)
+        fails = [f"{c.name}: {c.detail}" for c in checks.values() if c.status == FAIL]
+        assert fails == []
+        assert checks["API key works"].status == PASS
+        assert checks["Alpha News LK"].status == PASS          # completeness cross-check
+        assert checks["read-only dashboard user"].status == PASS
+        assert checks["API key not stored in database"].status == PASS
+        assert checks["matches YouTube right now"].status == PASS
+        assert client.quota_units_used >= 200                   # 2 channels x search (100 units)
+    finally:
+        with psycopg.connect(DB_URL, autocommit=True) as c:
+            # non-superusers (e.g. Neon's owner) need membership in a role to DROP OWNED BY it
+            c.execute(f"GRANT {TEST_READER} TO CURRENT_USER")
+            c.execute(f"DROP OWNED BY {TEST_READER}")
+            c.execute(f"DROP ROLE {TEST_READER}")
 
 
 def test_verify_detects_missing_video(conn):

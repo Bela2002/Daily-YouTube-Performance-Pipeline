@@ -249,21 +249,23 @@ class Verifier:
                  f"found in {hits} rows - rotate the key" if hits else "checked raw responses and run log")
 
     def check_reader_role(self, conn) -> None:
-        exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname='looker_reader'").fetchone()
+        role = db.READER_ROLE
+        exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
         if not exists:
             self.add("Security", "read-only dashboard user", WARN,
-                     "looker_reader not created - run `python -m yt_pipeline create-reader`")
+                     f"{role} not created - run `python -m yt_pipeline create-reader`")
             return
-        r = conn.execute("""SELECT has_schema_privilege('looker_reader','reporting','USAGE'),
-                                   has_schema_privilege('looker_reader','core','USAGE'),
-                                   has_schema_privilege('looker_reader','raw','USAGE'),
-                                   (SELECT bool_and(has_table_privilege('looker_reader', format('%I.%I', table_schema, table_name), 'SELECT'))
+        r = conn.execute("""SELECT has_schema_privilege(%(r)s, 'reporting', 'USAGE'),
+                                   has_schema_privilege(%(r)s, 'core', 'USAGE'),
+                                   has_schema_privilege(%(r)s, 'raw', 'USAGE'),
+                                   (SELECT bool_and(has_table_privilege(%(r)s, format('%%I.%%I', table_schema, table_name), 'SELECT'))
                                       FROM information_schema.views WHERE table_schema='reporting'),
-                                   (SELECT rolsuper OR rolcreaterole OR rolcreatedb FROM pg_roles WHERE rolname='looker_reader')""").fetchone()
+                                   (SELECT rolsuper OR rolcreaterole OR rolcreatedb FROM pg_roles WHERE rolname = %(r)s)""",
+                         {"r": role}).fetchone()
         reporting, core, raw, views, powerful = r
         ok = reporting and views and not core and not raw and not powerful
         self.add("Security", "read-only dashboard user", PASS if ok else FAIL,
-                 "looker_reader can read reporting views only" if ok else
+                 f"{role} can read reporting views only" if ok else
                  f"reporting={reporting} views={views} core={core} raw={raw} elevated={powerful}")
 
     def check_ssl(self, conn) -> None:
