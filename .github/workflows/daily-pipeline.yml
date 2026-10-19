@@ -1,0 +1,51 @@
+name: Daily YouTube pipeline
+
+on:
+  schedule:
+    # 00:30 UTC = 06:00 Sri Lanka time, so the dashboard is fresh every morning.
+    # (GitHub may start scheduled jobs a few minutes late.)
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days of uploads to refresh (default 28)"
+        required: false
+        default: "28"
+
+concurrency:
+  group: daily-youtube-pipeline
+  cancel-in-progress: false
+
+# least privilege: the workflow only needs to read the code
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      YOUTUBE_CHANNELS: ${{ vars.YOUTUBE_CHANNELS }}
+      LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '28' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply schema and views (idempotent)
+        run: python -m yt_pipeline init-db
+
+      - name: Run Extract-Load-Transform
+        run: python -m yt_pipeline run
+
+      - name: Show status
+        if: always()
+        run: python -m yt_pipeline status
