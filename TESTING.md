@@ -1,29 +1,66 @@
-# Testing with the real YouTube API
+# Testing and Validation
 
-The automated tests (`pytest`) use a fake YouTube API. This guide tests the **real** setup:
-your API key, your database, real channels. Work through it top to bottom. Every step says
-what you should see. If you see something else, the step has found a problem.
+This document describes how the pipeline is tested at four levels:
 
-> **Before you start.** Never paste your API key into chat, code, screenshots or commits.
-> It lives only in `.env` (local) and GitHub Secrets (CI). In Google Cloud Console, restrict the
-> key: **API restrictions → YouTube Data API v3 only**. **Application restrictions → None**,
+1. **Automated tests**: unit and end-to-end tests against a fake YouTube API.
+2. **Live verification**: the built-in `verify` command, run against the real API and database.
+3. **Manual validation**: SQL checks against YouTube, multi-day behaviour and failure scenarios.
+4. **Security, scheduling and dashboard checks.**
+
+Each check lists its **expected result**. Any other outcome indicates a defect.
+
+> **API key handling.** The API key belongs only in `.env` (local) and GitHub Actions secrets
+> (CI). It should never appear in code, commits, screenshots or chat. Restrict the key to
+> **YouTube Data API v3** in the Google Cloud Console, with **Application restrictions: None**,
 > because GitHub Actions has no fixed IP address.
 
-Commands are written for macOS/Linux. On Windows PowerShell, set a variable for one command
-with `$env:NAME="value"` on its own line before the command.
+Commands are shown in Bash syntax. In PowerShell, set a variable for a single command with
+`$env:NAME="value"` on its own line, then run the command.
 
 ---
 
-## 1. Automated tests (no API key needed)
+## 1. Automated tests
 
-Follow README **Step 9**: set `TEST_DATABASE_URL` to the empty `yt_test` database and run `pytest`.
-**Expect:** `40 passed`. They refuse to run against a database whose name does not contain
-`test`, because they delete its tables.
+**40 tests**: 22 unit tests (`tests/test_unit.py`) and 18 end-to-end tests
+(`tests/test_integration.py`).
 
-## 2. First real run (the "happy path")
+The end-to-end tests run the complete pipeline against a real PostgreSQL database. They
+replace the YouTube API with an in-memory fake (`tests/fake_youtube.py`), so no API key or
+network access is needed. The fake also asserts that the API key is only ever sent as a
+request header.
 
-Pick **one or two medium-size channels** that upload regularly, for example an agency client
-or a news channel. Put them in `YOUTUBE_CHANNELS`.
+### Running the tests
+
+```bash
+pytest                                                                  # unit tests only
+TEST_DATABASE_URL="postgresql://...@.../yt_test?sslmode=require" pytest  # all 40 tests
+```
+
+**Expected:** `40 passed` with `TEST_DATABASE_URL` set; `22 passed, 18 skipped` without it.
+
+![pytest: 40 passed](docs/images/pytest-results.png)
+
+### Safety guards
+
+- The integration tests **drop and recreate** the `raw`, `core` and `reporting` schemas. They
+  refuse to run unless the database name contains `test` and differs from `DATABASE_URL`.
+- PostgreSQL roles are shared by every database on a server. The tests therefore use a
+  dedicated `looker_reader_test` role, remove it afterwards, and never modify the production
+  `looker_reader` login.
+
+### Coverage
+
+| Area | Covered behaviour |
+|---|---|
+| **Data** | Required columns, playlist selection, duration parsing, `NULL` likes/comments, 24h/7d/28d counts and ranks, day-over-day view gains, same-day idempotency, retransform |
+| **Failures** | Retries (5xx, 429 with `Retry-After`, 403 rate limit, invalid JSON), retry exhaustion, quota stop, permission errors, 404s, one failing channel → `partial`, broken playlist → warning, failed run → rollback and clean re-run, overlapping runs blocked, raw purge, interrupted and killed runs closed, high-volume channels flagged instead of truncated |
+| **Verify command** | Detects a missing video, a leaked key, an invalid key and a missing schema |
+| **Security** | API key never in URLs, error messages, stored raw data or the run log; secrets masked in `Settings`; clear errors for missing or invalid configuration |
+
+The **Tests** workflow runs the full suite on every push and pull request, against a
+PostgreSQL 16 service container.
+
+## 2. Live verification
 
 ```bash
 python -m yt_pipeline init-db
@@ -31,122 +68,160 @@ python -m yt_pipeline run
 python -m yt_pipeline verify --deep
 ```
 
-**Expect from `run`:** `SUCCESS run_id=... channels=2 videos=N ... quota_units=...`.
+**Expected from `run`:** `SUCCESS run_id=... channels=N videos=N ... quota_units=...`
 
-**Expect from `verify --deep`:** every line `PASS` or `INFO`. Each line answers one question:
+**Expected from `verify --deep`:** every line is `PASS` or `INFO`.
 
-| Section | What it proves |
+![verify --deep output](docs/images/verify-deep.png)
+
+| Section | What it checks |
 |---|---|
-| API | your key works with the header method, and every channel resolves |
-| Completeness | **every video YouTube's search finds for the 28-day window is in your DB.** This is an independent cross-check using a different API endpoint |
-| Data | required fields are filled; one row per video per day; top 5 videos agree with YouTube *right now* |
-| Security | key not stored in DB or git history; SSL on; read-only dashboard user is really read-only |
+| **API** | The key authenticates via the request header, and every configured channel resolves |
+| **Database** | Schemas, tables and reporting views exist |
+| **Pipeline** | The latest run succeeded and is recent (warns if older than 26 hours); every channel is stored |
+| **Completeness** *(`--deep`)* | Every video that YouTube search returns for the lookback window is in the database. This is an independent cross-check using a different API endpoint |
+| **Data** | Required fields are filled; exactly one row per video per day; the top 5 videos match the live API |
+| **Security** | Key not stored in the database or git history; SSL in use; `.env` not committed; `looker_reader` is read-only |
 
-`--deep` costs **100 quota units per 50 videos per channel**, out of your 10,000 per day.
-Plain `verify` costs about 10 units. Use `--deep` once after setup and after any code change,
-not every day.
+**Quota cost:** plain `verify` uses about 5–10 units. `--deep` adds 100 units per search page
+(up to 50 videos) per channel. Use `--deep` after setup and after code changes, not daily.
 
-> **Does it get ALL videos from the channel?** No, by design. It gets every public video
-> **published in the last 28 days** (`LOOKBACK_DAYS`), because the brief asks about the
-> 24h / 7d / 28d windows. Each daily run adds that day's snapshot, so history builds up from
-> your first run. The Completeness check is what proves nothing *inside* the window is missed.
-> For a very busy channel (more than 5,000 uploads in 28 days), the run is marked `PARTIAL`
-> with "raise MAX_UPLOAD_PAGES". It never drops videos silently.
+### Collection scope
 
-## 3. Check the numbers by eye against YouTube
+The pipeline collects every public video **published within the lookback window** (default
+28 days), not a channel's full upload history. This matches the 24h / 7d / 28d reporting
+windows. History accumulates through one snapshot per day from the first run onward. The
+completeness check confirms that nothing inside the window is missed.
 
-Run these in the **Neon SQL Editor**, or in `psql "$DATABASE_URL"`.
+## 3. Manual data validation
+
+The following queries can be run in the Neon SQL Editor or with `psql "$DATABASE_URL"`.
+
+### 3.1 Uploads in the last 24 hours
 
 ```sql
--- What was uploaded in the last 24 hours?
 SELECT channel_name, video_title, published_at_colombo, video_duration,
        view_count, like_count, comment_count
 FROM reporting.video_by_window
 WHERE time_window = 'Last 24 hours'
 ORDER BY published_at_utc DESC;
 ```
-Open each channel on youtube.com → **Videos** tab (and **Shorts** / **Live** tabs). The videos
-from the last 24 hours should be the same list.
 
-| Check | How | Expect |
+Compare the result with each channel's **Videos**, **Shorts** and **Live** tabs on youtube.com.
+
+| Check | Method | Expected |
 |---|---|---|
-| Titles, durations | compare 3 videos | identical |
-| Views / likes / comments | compare 3 videos | close, not identical: counts change every minute, and the run was earlier |
-| Publish time | YouTube shows local time | matches `published_at_colombo` |
-| Playlist | open a video that is in one of the channel's playlists | its `playlist_name` matches; videos in no playlist have it empty |
-| Hidden likes / comments off | find such a video | `like_count` / `comment_count` is empty (NULL), not 0 |
+| Video list | Compare with the channel pages | Same videos |
+| Titles and durations | Compare 3 videos | Identical |
+| Views / likes / comments | Compare 3 videos | Close but not identical, because counters change continuously after capture |
+| Publish time | Compare with YouTube (local time) | Matches `published_at_colombo` |
+| Playlist | A video that belongs to a playlist | `playlist_name` matches; empty for videos in no public playlist |
+| Hidden likes / comments disabled | A video with either setting | `like_count` / `comment_count` is `NULL`, not `0` |
 
-> Shorts and finished live streams **are included**, because they are uploads too.
-> Scheduled premieres appear once they go public.
+Shorts and completed live streams are included, because they are part of a channel's uploads.
+Scheduled premieres appear once they become public.
 
-## 4. Second day
+### 3.2 Multi-day history
 
-Run the pipeline again the next day (or let the schedule do it), then:
+After a second daily run:
+
 ```sql
-SELECT data_capture_date, count(*) FROM reporting.video_daily_dataset GROUP BY 1 ORDER BY 1;
+SELECT data_capture_date, count(*)
+FROM reporting.video_daily_dataset
+GROUP BY 1 ORDER BY 1;
+
 SELECT video_title, view_count, views_gained_since_prev_capture
-FROM reporting.video_latest ORDER BY views_gained_since_prev_capture DESC NULLS LAST LIMIT 10;
+FROM reporting.video_latest
+ORDER BY views_gained_since_prev_capture DESC NULLS LAST
+LIMIT 10;
 ```
-**Expect:** two capture dates, and `views_gained_since_prev_capture` filled in.
 
-## 5. Failure drills: break it on purpose
+**Expected:** two or more capture dates, and `views_gained_since_prev_capture` populated.
 
-Do these one at a time and set things back afterwards. Then check the run log:
-`python -m yt_pipeline status`.
+## 4. Failure scenarios
 
-| # | How to break it | Expected result |
+Each scenario is run on its own, with the setting restored afterwards. The run log is
+inspected with `python -m yt_pipeline status`, and exit codes with `echo $?` (Bash) or
+`echo $LASTEXITCODE` (PowerShell).
+
+| # | Scenario | Expected behaviour |
 |---|---|---|
-| a | Wrong API key: `YOUTUBE_API_KEY=wrong python -m yt_pipeline run` | `FAILED: YouTube API error ... API key not valid`, exit code 1, run logged `failed`, existing data untouched |
-| b | Add a fake channel: `run --channels "@yourchannel,UCxxxxxxxxxxxxxxxxxxxxxx"` | `PARTIAL`, exit code 4, the real channel is saved, `WARNING: channel not found: UCxxx…` |
-| c | **Real quota error**: Cloud Console → IAM & Admin → **Quotas** → YouTube Data API v3 → *Queries per day* → edit it down to **5**, then run | `FAILED: quota exceeded`, exit code 3, nothing half-saved. **Set the quota back to 10,000 afterwards.** The change can take a few minutes to apply. |
-| d | Turn Wi-Fi off and run | retry warnings, then `FAILED: ... network error`. The error must **not** show your key (look for `***REDACTED***` if a URL appears) |
-| e | Wrong DB password in `DATABASE_URL` | 3 connection attempts, then `FAILED: database error: ... password authentication failed`, with no Python traceback |
-| f | Run twice on the same day | today's row count in `core.video_daily_snapshot` stays the same (rows are updated, not duplicated) |
-| g | Start a run, press **Ctrl+C** halfway | run logged `failed` (`KeyboardInterrupt`), nothing half-saved; the next run works normally |
-| h | Start two runs at the same time in two terminals (use several channels so it takes a few seconds) | the second says `Another pipeline run is already in progress` |
+| a | Invalid API key: `YOUTUBE_API_KEY=wrong python -m yt_pipeline run` | `FAILED: YouTube API error ... API key not valid`, exit code `1`, run logged as `failed`, existing data untouched |
+| b | Non-existent channel: `run --channels "@realchannel,UCxxxxxxxxxxxxxxxxxxxxxx"` | `PARTIAL`, exit code `4`, valid channel saved, `WARNING: channel not found: UCxxx…` |
+| c | Quota exhausted: Cloud Console → IAM & Admin → **Quotas** → YouTube Data API v3 → *Queries per day* lowered to 5 | `FAILED: quota exceeded`, exit code `3`, nothing partially saved. The quota is restored to 10,000 afterwards; changes may take a few minutes to apply |
+| d | No network connection | Retry warnings, then `FAILED: ... network error`. The key never appears in output (any URL shows `***REDACTED***`) |
+| e | Wrong database password in `DATABASE_URL` | 3 connection attempts, then `FAILED: database error: ... password authentication failed`, without a Python traceback |
+| f | Two runs on the same day | Today's row count in `core.video_daily_snapshot` is unchanged; rows are updated, not duplicated |
+| g | **Ctrl+C** during a run | Run logged as `failed` (`KeyboardInterrupt`), nothing partially saved; the next run succeeds |
+| h | Two simultaneous runs (several channels, so the run lasts a few seconds) | The second run reports `Another pipeline run is already in progress` |
 
-To see the exit code: macOS/Linux `echo $?`, PowerShell `echo $LASTEXITCODE`.
+Example: scenario **b** (partial run with one invalid channel).
 
-## 6. Security checks
+![Partial run with an invalid channel](docs/images/failure-partial-run.png)
+
+Run log after the failure scenarios (`python -m yt_pipeline status`):
+
+![Run log after failure scenarios](docs/images/failure-status-log.png)
+
+## 5. Security checks
 
 ```bash
-python -m yt_pipeline create-reader        # read-only login for Looker Studio
-python -m yt_pipeline verify               # Security section must be all PASS
-git status                                 # .env must NOT be listed
-git grep -n "AIza"                         # must print nothing (Google API keys start with AIza)
+python -m yt_pipeline verify      # Security section: all PASS
+git status                        # .env is not listed
+git grep -n "AIza"                # no output (Google API keys start with "AIza")
 ```
-* Connect once as the reader and try a forbidden table:
-  `psql "postgresql://looker_reader:PASSWORD@HOST/DB?sslmode=require" -c "select * from core.video"`
-  → `permission denied for schema core`.
-* After the GitHub Action runs, open its log. Secrets must appear as `***`.
-* If a key ever leaks (committed, pasted, screenshotted): **delete it in Cloud Console and create
-  a new one.** Removing it from git is not enough.
 
-## 7. The daily schedule
-
-1. Push to GitHub and add the secrets and the variable (see README).
-2. **Actions → Daily YouTube pipeline → Run workflow** → it should go green.
-3. The next morning, check that it ran **by itself** after 06:00 Sri Lanka time
-   (GitHub can be a few minutes late). `verify` warns if the latest run is older than 26 hours.
-4. Make it fail once on purpose (e.g. a wrong secret) and confirm GitHub emails you.
-
-## 8. Dashboard checks
-
-| Check | Expect |
+| Check | Expected |
 |---|---|
-| "Uploads last 24h / 7d / 28d" scorecards | same numbers as the `uploads last ...` lines in `verify` |
-| Last-24-hours table | same list as the SQL in step 3 |
-| Time-window dropdown | changes only the top-videos table, not the scorecards |
-| Click the Views / Likes / Comments headers | the table re-sorts |
-| Channel filter | every chart changes |
-| Date range | today's uploads still visible (see the date-range note in docs/LOOKER_STUDIO.md) |
+| Query a core table as the reader: `psql "postgresql://looker_reader:PASSWORD@HOST/DB?sslmode=require" -c "select * from core.video"` | `permission denied for schema core` |
+| GitHub Actions run logs | Secrets are shown as `***` |
 
-## Before you submit
+### Reader access check without `psql`
 
-- [ ] `pytest` passes (40)
-- [ ] `verify --deep` has no FAIL
-- [ ] failure drills a–h behave as described
-- [ ] at least 2 days of data (so `views gained` shows)
-- [ ] scheduled run worked by itself at least once
-- [ ] dashboard numbers match `verify`
-- [ ] no key in git (`git grep AIza` is empty), `.env` not committed
+If `psql` is not installed, the same check can be run from the project's virtual environment.
+The command takes the host and database from `DATABASE_URL`, connects as `looker_reader`,
+and prompts for the password without displaying it:
+
+```bash
+python -c "import os, getpass, psycopg; from yt_pipeline.config import Settings; from psycopg.conninfo import conninfo_to_dict; info = conninfo_to_dict(os.environ['DATABASE_URL']); info.update(user='looker_reader', password=getpass.getpass('looker_reader password: ')); conn = psycopg.connect(**info); print('Connected as', conn.info.user); print('reporting.video_latest rows:', conn.execute('SELECT count(*) FROM reporting.video_latest').fetchone()[0]); conn.execute('SELECT * FROM core.video LIMIT 1')"
+```
+
+**Expected:** the login succeeds, the `reporting` view returns a row count, and the query on
+`core.video` fails with `InsufficientPrivilege: permission denied for schema core`.
+
+![Read-only login denied access to core tables](docs/images/security-reader-denied.png)
+
+If a key is ever exposed (committed, pasted or captured in a screenshot), it must be revoked in
+the Google Cloud Console and replaced. Removing it from git history is not sufficient.
+
+## 6. Scheduled runs
+
+| Check | Expected |
+|---|---|
+| **Actions → Daily YouTube pipeline → Run workflow** | The run completes successfully |
+| The morning after setup | A scheduled run started shortly after 06:00 Sri Lanka time (00:30 UTC). GitHub may start scheduled jobs a few minutes late |
+| A deliberately failing run (for example, an invalid secret) | GitHub sends a failure notification email |
+| `verify` when the latest run is older than 26 hours | Freshness warning |
+
+![Scheduled workflow run](docs/images/scheduled-run.png)
+
+## 7. Dashboard checks
+
+| Check | Expected |
+|---|---|
+| "Uploads last 24h / 7d / 28d" scorecards | Match the `uploads last ...` lines in `verify` |
+| "Uploaded in the last 24 hours" table | Matches the query in section 3.1 |
+| Time-window drop-down | Changes only the top-videos table, not the scorecards |
+| Views / Likes / Comments column headers | Clicking re-sorts the table |
+| Channel filter | Filters every chart |
+| Date range control | Today's uploads remain visible (see [docs/LOOKER_STUDIO.md](docs/LOOKER_STUDIO.md)) |
+
+## Validation checklist
+
+- [x] `pytest`: 40 passed
+- [x] `verify --deep`: no `FAIL`
+- [x] Failure scenarios a–h behave as described
+- [x] At least two capture dates, with `views_gained_since_prev_capture` populated
+- [x] At least one scheduled run completed on its own
+- [x] Dashboard figures match `verify`
+- [x] `git grep AIza` returns nothing and `.env` is not tracked

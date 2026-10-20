@@ -1,71 +1,106 @@
-# Assumptions and limitations
+# Assumptions and Limitations
+
+This document records the design decisions behind the pipeline and the constraints it
+operates under.
 
 ## Assumptions
 
-1. **"Previous 24 hours" and the 7/28-day windows** are measured back from the start of the
-   latest successful pipeline run (`reference_ts_utc`), not from the moment the dashboard is
-   opened. This keeps the numbers consistent with what was collected.
-2. **Daily collection = new uploads + refreshed stats.** Each run captures every video published
-   in the last 24 hours *and* refreshes statistics for all videos published in the last 28 days
-   (`LOOKBACK_DAYS`), so the 7- and 28-day "top performers" use current numbers.
-3. **"Top performing by views"** ranks videos *published in the window* by their **total
-   (lifetime) views** at capture time — the Data API v3 only exposes lifetime counters.
-   `views_gained_since_prev_capture` (day-over-day difference between snapshots) is added as a
-   secondary "momentum" metric.
-4. **Playlist fields**: a video can be in several playlists. `playlist_id`/`playlist_name` hold
-   the playlist it was added to first; `all_playlist_names` lists all of them; `playlist_count`
-   gives the number. Fields are empty when the video is in no public playlist.
-5. **Grain**: one snapshot row per video per UTC capture date. Re-running on the same day
-   overwrites that day's row (idempotent); a new day adds a new row, building history.
-6. **Public data only**, accessed with an API key (no OAuth). Channels are configured by ID
-   (`UC…`) or @handle and the dashboard is filterable by channel.
-7. **All uploads count as videos**: Shorts, finished live streams and premieres are included,
-   because they are all on the channel's uploads list. Scheduled (not yet public) videos appear
-   once they go public.
-8. **"Uploaded in the last 24 hours"** is as of the daily run (06:00 Sri Lanka time). A video
-   uploaded at 10:00 appears in the next morning's data. That is the nature of a daily batch.
-9. All timestamps are stored in UTC; a Sri Lanka (`Asia/Colombo`) publish time is added for
-   readability.
+### Time windows and collection
+
+1. **Reference time.** The 24-hour, 7-day and 28-day windows are measured back from the start
+   of the latest successful or partial pipeline run (`reference_ts_utc`), not from the moment
+   the dashboard is opened. This keeps the reported figures consistent with the data that was
+   actually collected.
+2. **Daily collection scope.** Each run captures every video published in the last 24 hours
+   **and** refreshes the statistics of every video published within `LOOKBACK_DAYS`
+   (default 28). The 7-day and 28-day top-performer rankings therefore use current figures.
+3. **Batch latency.** "Uploaded in the last 24 hours" reflects the state at the time of the
+   daily run (06:00 Sri Lanka time). A video published later that day appears in the next
+   run's data.
+
+### Metrics
+
+4. **"Top performing by views"** ranks videos *published within a window* by their total
+   (lifetime) view count at capture time, because the Data API v3 exposes lifetime counters
+   only. `views_gained_since_prev_capture`, the day-over-day difference between snapshots,
+   is provided as a secondary momentum metric.
+5. **Engagement rate** is defined as `(likes + comments) / views`. Hidden counters count as zero
+   in this calculation.
+
+### Data model
+
+6. **Grain.** One snapshot row per video per UTC capture date. Re-running on the same day
+   overwrites that day's row (idempotent), and each new day adds a row, building history.
+7. **Playlists.** A video can belong to several playlists. `playlist_id` and `playlist_name`
+   refer to the playlist the video was added to first, `all_playlist_names` lists every
+   playlist, and `playlist_count` gives the total. These fields are empty for videos in no
+   public playlist.
+8. **Video types.** Shorts, completed live streams and premieres are all included, because
+   they appear in a channel's uploads. Scheduled videos appear once they become public.
+9. **Time zones.** All timestamps are stored in UTC. A Sri Lanka (`Asia/Colombo`) publish
+   time is provided for readability.
+
+### Access
+
+10. **Public data only.** Data is accessed with an API key (no OAuth). Channels are configured
+    by ID (`UC…`) or `@handle`, and the dashboard can be filtered by channel.
 
 ## Limitations
 
-1. **No true "views in the last 24 hours".** That metric needs the YouTube *Analytics* API with
-   channel-owner OAuth. Day-over-day deltas only become available from the second daily run.
-2. **History starts at the first run.** The API has no historical counters, so earlier days
-   cannot be backfilled (the first run does pick up all uploads from the last 28 days).
-3. **Hidden counters**: `like_count` is NULL when likes are hidden and `comment_count` is NULL
-   when comments are disabled. Private, unlisted, deleted and scheduled (not yet public) videos
-   are not visible to an API key.
-4. **High-volume channels**: up to `MAX_UPLOAD_PAGES` × 50 = 5,000 uploads per channel per
-   28-day window are collected. Beyond that the run is marked `partial` with a clear message,
-   never silently truncated.
-5. **Playlist mapping is capped** (`MAX_PLAYLISTS_PER_CHANNEL`, `MAX_PAGES_PER_PLAYLIST`) to
-   protect quota; videos deep inside very large playlists may show no playlist. It can be turned
-   off with `FETCH_PLAYLISTS=false`.
-6. **Quota**: 10,000 units/day by default. A typical channel uses roughly 5–60 units per run (a very busy news channel a few hundred), so
-   dozens of channels fit, but very large playlist counts reduce that.
-7. **Run outcomes**: load, transform and the run status are committed in one transaction.
-   A `failed` run (quota exceeded, database down) writes nothing except its `failed` row in
-   `core.pipeline_run` and can simply be re-run. If one channel fails but others succeed, the
-   good channels are saved, the run is marked `partial` with the reason, and the CLI exits with
-   code 4 so the scheduler still flags it. A deleted playlist only produces a warning.
-8. **Raw retention**: raw API JSON is purged after `RAW_RETENTION_DAYS` (default 90) to stay
-   within free-tier storage; the daily history in `core` is kept. `retransform` therefore only
-   works for runs inside that window.
-9. **Scheduling**: GitHub Actions cron can start a few minutes late, and GitHub pauses scheduled
-   workflows in public repos after 60 days without commits (one click re-enables them).
-10. **Looker Studio needs an internet-reachable database** (e.g. Neon/Supabase free tier); a
-   localhost PostgreSQL cannot be connected directly. The PostgreSQL connector returns at most
-   150k rows per query, far above this dataset's size.
-11. Live streams report a duration of 0 while live; durations update once the stream ends.
-12. **Testing**: the YouTube API is replaced by a faithful fake in the automated tests (no key
-    or network needed in CI). Behaviour against the live API is checked with
-    `python -m yt_pipeline verify --deep` and the manual drills in TESTING.md. A change in the
-    API's response format would show up as a failed run, not as a failing test.
-13. **Nice-to-have GCP parts not implemented**: the pipeline runs on GitHub Actions (free,
-    no server to manage) and stores data in Neon PostgreSQL, which the brief allows. Moving to
-    Cloud Run + Cloud Scheduler would need only a small container wrapper and no code changes,
+### Data availability
+
+1. **No true "views in the last 24 hours".** That metric requires the YouTube *Analytics* API
+   with channel-owner OAuth. Day-over-day deltas are available from the second daily run onward.
+2. **History starts at the first run.** The API provides no historical counters, so earlier
+   days cannot be backfilled. The first run does collect all uploads from the lookback window.
+3. **Hidden counters.** `like_count` is `NULL` when likes are hidden and `comment_count` is
+   `NULL` when comments are disabled. Private, unlisted, deleted and scheduled videos are not
+   visible to an API key.
+4. **Live streams** report a duration of 0 while live. The duration updates once the stream ends.
+
+### Scale and quota
+
+5. **Quota.** The default allowance is 10,000 units per day. A typical channel uses roughly
+   5–60 units per run, and a high-volume news channel a few hundred. Dozens of channels fit
+   within the default quota, although channels with many playlists reduce that number.
+6. **High-volume channels.** Up to `MAX_UPLOAD_PAGES` × 50 uploads (5,000 by default) are
+   collected per channel per window. Beyond that, the run is marked `partial` with an explicit
+   message and is never silently truncated.
+7. **Playlist mapping is capped** by `MAX_PLAYLISTS_PER_CHANNEL` and `MAX_PAGES_PER_PLAYLIST`
+   to protect quota. Videos deep inside very large playlists may show no playlist. Mapping
+   can be disabled with `FETCH_PLAYLISTS=false`.
+
+### Operations
+
+8. **Run outcomes.** Load, transform and run status are committed in a single transaction. A
+   `failed` run (quota exceeded, database unavailable) writes only its `failed` entry in
+   `core.pipeline_run` and can simply be re-run. If some channels fail and others succeed,
+   the successful channels are saved, the run is marked `partial` with the reason, and the
+   CLI exits with code 4 so the scheduler flags it. A deleted playlist produces a warning only.
+9. **Raw retention.** Raw API JSON is purged after `RAW_RETENTION_DAYS` (default 90) to stay
+   within free-tier storage limits. Daily history in `core` is kept indefinitely.
+   `retransform` therefore works only for runs within the retention period.
+10. **Scheduling.** GitHub Actions cron jobs can start a few minutes late. GitHub also disables
+    scheduled workflows in public repositories after 60 days without repository activity;
+    they can be re-enabled from the Actions tab.
+
+### Infrastructure
+
+11. **Database connection.** The pipeline requires a direct (non-pooled) PostgreSQL
+    connection, because transaction-mode poolers such as Neon's `-pooler` host break the run
+    lock. It refuses to start on a pooled connection and explains why.
+12. **Internet-reachable database.** Looker Studio connects from Google's cloud, so a
+    `localhost` database cannot be used directly. A hosted database such as Neon or Supabase
+    is required. The Looker Studio PostgreSQL connector returns at most 150,000 rows per query,
+    well above this dataset's size.
+13. **Hosting.** The pipeline runs on GitHub Actions and stores data in Neon PostgreSQL. A
+    move to Google Cloud Run and Cloud Scheduler would need only a small container wrapper,
     because all configuration comes from environment variables.
-14. **Database connection**: the pipeline needs a direct (non-pooled) PostgreSQL connection,
-    because transaction-mode poolers such as Neon's `-pooler` host break the run lock. It
-    refuses to start on a pooled connection and says why.
+
+### Testing
+
+14. **Fake API in automated tests.** The automated tests replace the YouTube API with an
+    in-memory fake, so CI needs no key or network access. Behaviour against the live API is
+    checked with `python -m yt_pipeline verify --deep` and the procedures in
+    [TESTING.md](TESTING.md). A change in the API's response format would surface as a failed
+    run rather than a failing test.
